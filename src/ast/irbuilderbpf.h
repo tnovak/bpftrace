@@ -148,6 +148,7 @@ public:
   StructType *GetStructType(std::string name, const std::vector<llvm::Type *> & elements, bool packed = false);
   AllocaInst *CreateUSym(llvm::Value *val, const location &loc);
   Value *CreateRegisterRead(Value *ctx, const std::string &builtin);
+  Value *CreateRegisterRead(Value *ctx, int offset, const std::string &name);
   Value      *CreatKFuncArg(Value *ctx, SizedType& type, std::string& name);
   CallInst *CreateSkbOutput(Value *skb,
                             Value *len,
@@ -174,6 +175,11 @@ public:
   // BEGIN { if (nsecs > 0) { $a = 1 } else { $a = 2 } print($a); exit() }
   void hoist(const std::function<void()> &functor);
   int helper_error_id_ = 0;
+
+  // Returns the integer type used to represent pointers of the target arch.
+  llvm::Type *getPointerStorageTy();
+  // Returns the integer type whose size equals that of struct pt_regs fields.
+  llvm::Type *getRegisterTy();
 
 private:
   Module &module_;

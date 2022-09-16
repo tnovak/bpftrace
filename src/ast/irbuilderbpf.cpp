@@ -247,10 +247,6 @@ llvm::Type *IRBuilderBPF::GetType(const SizedType &stype)
 
     ty = GetStructType(ty_name.str(), llvm_elems, false);
   }
-  else if (stype.IsPtrTy())
-  {
-    ty = getInt64Ty();
-  }
   else
   {
     switch (stype.GetSize())
@@ -1162,16 +1158,29 @@ Value *IRBuilderBPF::CreateRegisterRead(Value *ctx, const std::string &builtin)
   else // argX
     offset = arch::arg_offset(atoi(builtin.substr(3).c_str()));
 
-  Value *ctx_ptr = CreatePointerCast(ctx, getInt64Ty()->getPointerTo());
+  return CreateRegisterRead(ctx, offset, builtin);
+}
+
+Value *IRBuilderBPF::CreateRegisterRead(Value *ctx,
+                                        int offset,
+                                        const std::string &name)
+{
+  Value *ctx_ptr = CreatePointerCast(ctx, getRegisterTy()->getPointerTo());
   // LLVM optimization is possible to transform `(uint64*)ctx` into
   // `(uint8*)ctx`, but sometimes this causes invalid context access.
   // Mark every context access to suppress any LLVM optimization.
-  Value *result = CreateLoad(getInt64Ty(),
-                             CreateGEP(getInt64Ty(), ctx_ptr, getInt64(offset)),
-                             builtin);
+  Value *result = CreateLoad(
+      getRegisterTy(),
+      CreateGEP(getRegisterTy(), ctx_ptr, getInt64(offset)),
+      name);
   // LLVM 7.0 <= does not have CreateLoad(*Ty, *Ptr, isVolatile, Name),
   // so call setVolatile() manually
   dyn_cast<LoadInst>(result)->setVolatile(true);
+  // Caller expects an int64, so add a cast if the register size is different.
+  if (result->getType()->getIntegerBitWidth() != 64)
+  {
+    result = CreateIntCast(result, getInt64Ty(), false);
+  }
   return result;
 }
 
@@ -1338,6 +1347,26 @@ StoreInst *IRBuilderBPF::createAlignedStore(Value *val,
 #else
   return CreateAlignedStore(val, ptr, MaybeAlign(align));
 #endif
+}
+
+llvm::Type *IRBuilderBPF::getPointerStorageTy()
+{
+  switch (sizeof(uintptr_t))
+  {
+    case 4:
+      return getInt32Ty();
+    case 8:
+      return getInt64Ty();
+    default:
+      LOG(FATAL) << "Unsupported pointer size";
+  }
+}
+
+llvm::Type *IRBuilderBPF::getRegisterTy()
+{
+  // Bitwidth of registers values in struct pt_regs is the same as the pointer
+  // size on all supported architectures.
+  return getPointerStorageTy();
 }
 
 } // namespace ast

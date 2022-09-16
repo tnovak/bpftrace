@@ -357,8 +357,8 @@ SizedType CreateArray(size_t num_elements, const SizedType &element_type)
 
 SizedType CreatePointer(const SizedType &pointee_type, AddrSpace as)
 {
-  // Pointer itself is always an uint64
-  auto ty = SizedType(Type::pointer, 8);
+  // Size of the pointer itself depends on the target platform
+  auto ty = SizedType(Type::pointer, sizeof(uintptr_t));
   ty.element_type_ = std::make_shared<SizedType>(pointee_type);
   ty.SetAS(as);
   return ty;
