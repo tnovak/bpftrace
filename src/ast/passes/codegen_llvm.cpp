@@ -668,10 +668,6 @@ void CodegenLLVM::visit(Call &call)
     auto arg0 = call.vargs->front();
     auto scoped_del = accept(arg0);
     auto addrspace = arg0->type.GetAS();
-    AllocaInst *first = b_.CreateAllocaBPF(b_.getInt64Ty(),
-                                           call.func + "_first");
-    AllocaInst *second = b_.CreateAllocaBPF(b_.getInt64Ty(),
-                                            call.func + "_second");
     Value *perfdata = b_.CreateGetJoinMap(ctx_, call.loc);
     Function *parent = b_.GetInsertBlock()->getParent();
 
@@ -690,7 +686,6 @@ void CodegenLLVM::visit(Call &call)
                     notzero,
                     zero);
 
-    // arg0
     b_.SetInsertPoint(notzero);
     b_.CreateStore(b_.getInt64(asyncactionint(AsyncAction::join)),
                    b_.CreatePointerCast(perfdata,
@@ -700,33 +695,42 @@ void CodegenLLVM::visit(Call &call)
                        b_.CreateGEP(b_.getInt8Ty(), perfdata, b_.getInt64(8)),
                        b_.getInt64Ty()->getPointerTo()));
     join_id_++;
-    AllocaInst *arr = b_.CreateAllocaBPF(b_.getInt64Ty(), call.func + "_r0");
-    b_.CreateProbeRead(ctx_, arr, 8, expr_, addrspace, call.loc);
+
+    llvm::Type *ptr_ty = b_.getPointerStorageTy();
+    const size_t ptr_size = ptr_ty->getIntegerBitWidth() / 8;
+
+    assert(expr_->getType()->isIntegerTy());
+    // make sure expr_ is always an int64 to avoid casts when doing arithmetic
+    // on it later
+    if (expr_->getType() != b_.getInt64Ty())
+      expr_ = b_.CreateIntCast(expr_, b_.getInt64Ty(), false);
+
+    // temporary that stores the value of arg[i]
+    AllocaInst *arr = b_.CreateAllocaBPF(ptr_ty, call.func + "_r0");
+
+    // arg0
+    b_.CreateProbeRead(ctx_, arr, ptr_size, expr_, addrspace, call.loc);
     b_.CreateProbeReadStr(
         ctx_,
         b_.CreateGEP(b_.getInt8Ty(), perfdata, b_.getInt64(8 + 8)),
         bpftrace_.join_argsize_,
-        b_.CreateLoad(b_.getInt64Ty(), arr),
+        b_.CreateLoad(ptr_ty, arr),
         addrspace,
         call.loc);
 
     for (unsigned int i = 1; i < bpftrace_.join_argnum_; i++)
     {
-      // argi
-      b_.CreateStore(b_.CreateAdd(expr_, b_.getInt64(8 * i)), first);
-      b_.CreateProbeRead(ctx_,
-                         second,
-                         8,
-                         b_.CreateLoad(b_.getInt64Ty(), first),
-                         addrspace,
-                         call.loc);
+      // advance to argi
+      expr_ = b_.CreateAdd(expr_, b_.getInt64(ptr_size));
+
+      b_.CreateProbeRead(ctx_, arr, ptr_size, expr_, addrspace, call.loc);
       b_.CreateProbeReadStr(
           ctx_,
           b_.CreateGEP(b_.getInt8Ty(),
                        perfdata,
                        b_.getInt64(8 + 8 + i * bpftrace_.join_argsize_)),
           bpftrace_.join_argsize_,
-          b_.CreateLoad(b_.getInt64Ty(), second),
+          b_.CreateLoad(ptr_ty, arr),
           addrspace,
           call.loc);
     }
