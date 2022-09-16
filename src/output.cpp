@@ -255,6 +255,19 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
     }
     // lgtm[cpp/missing-return]
   }
+  else if (type.IsPtrTy())
+  {
+    switch (type.GetSize())
+    {
+      case 8:
+        return std::to_string(read_data<uint64_t>(value.data()) / div);
+      case 4:
+        return std::to_string(read_data<uint32_t>(value.data()) / div);
+      default:
+        LOG(FATAL) << "value_to_str: Invalid pointer size: " << type.GetSize();
+        return {};
+    }
+  }
   else if (type.IsSumTy() || type.IsIntTy())
   {
     if (type.IsSigned())
