@@ -1519,6 +1519,16 @@ void CodegenLLVM::binop_ptr(Binop &binop)
     Value *other_expr = leftptr ? rhs : lhs;
     auto elem_size = b_.getInt64(ptr.GetPointeeTy()->GetSize());
     expr_ = b_.CreateMul(elem_size, other_expr);
+    assert(expr_->getType() == b_.getInt64Ty());
+
+    auto ptr_ty = ptr_expr->getType();
+    if (ptr_ty->isIntegerTy() && ptr_ty != b_.getInt64Ty())
+    {
+      // If the pointer expression isn't an int64, cast the operand to make
+      // sure that the types match.
+      expr_ = b_.CreateIntCast(expr_, ptr_ty, false);
+    }
+
     if (binop.op == Operator::PLUS)
       expr_ = b_.CreateAdd(ptr_expr, expr_);
     else
@@ -1624,8 +1634,9 @@ void CodegenLLVM::unop_ptr(Unop &unop)
       if (unop.type.IsIntegerTy() || unop.type.IsPtrTy())
       {
         auto *et = type.GetPointeeTy();
-        // Pointer always 64 bits wide
-        int size = unop.type.IsIntegerTy() ? et->GetIntBitWidth() / 8 : 8;
+        int size = unop.type.IsIntegerTy()
+                       ? et->GetIntBitWidth() / 8
+                       : b_.getPointerStorageTy()->getIntegerBitWidth() / 8;
         AllocaInst *dst = b_.CreateAllocaBPF(*et, "deref");
         b_.CreateProbeRead(ctx_, dst, size, expr_, type.GetAS(), unop.loc);
         expr_ = b_.CreateLoad(b_.GetType(*et), dst);
@@ -1811,7 +1822,8 @@ void CodegenLLVM::visit(FieldAccess &acc)
     // (bitfields and _data_loc)
     if (field.type.IsIntTy() && (field.is_bitfield || field.is_data_loc))
     {
-      Value *src = b_.CreateAdd(expr_, b_.getInt64(field.offset));
+      Value *src = b_.CreateAdd(
+          expr_, b_.GetIntSameSize(field.offset, expr_->getType()));
 
       if (field.is_bitfield)
       {
@@ -1923,6 +1935,17 @@ void CodegenLLVM::visit(Cast &cast)
                              b_.getIntNTy(8 * cast.type.GetSize()),
                              cast.type.IsSigned(),
                              "cast");
+  }
+  else if (cast.type.IsPtrTy() && expr_->getType()->isIntegerTy())
+  {
+    // If casting to a pointer and the size of the integer expression doesn't
+    // match the pointer size (e.g. "(struct Foo*)(uint8)42"), add an explicit
+    // cast.
+    auto pointer_ty = b_.GetType(cast.type);
+    if (expr_->getType() != pointer_ty)
+    {
+      expr_ = b_.CreateIntCast(expr_, pointer_ty, false, "cast");
+    }
   }
 }
 
@@ -2058,6 +2081,16 @@ void CodegenLLVM::visit(AssignMapStatement &assignment)
     // expr currently contains a pointer to the struct
     // and that's what we are saving
     AllocaInst *dst = b_.CreateAllocaBPF(map.type, map.ident + "_ptr");
+
+    auto expr_ty = expr->getType();
+    if (expr_ty->isIntegerTy() && expr_ty != b_.GetType(map.type))
+    {
+      // Pointer assignment may require a cast if the integer expression has a
+      // different size. For example, in "@ = curtask" expr is always i64, but
+      // GetType(map.type) depends on the pointer size.
+      expr = b_.CreateIntCast(expr, b_.GetType(map.type), false);
+    }
+
     b_.CreateStore(expr, dst);
     val = dst;
     self_alloca = true;
@@ -2105,8 +2138,23 @@ void CodegenLLVM::visit(AssignVarStatement &assignment)
   if (var.type.IsArrayTy() || var.type.IsRecordTy())
   {
     // For arrays and structs, only the pointer is stored
-    b_.CreateStore(b_.CreatePtrToInt(expr_, b_.getInt64Ty()),
-                   variables_[var.ident]);
+    assert(variables_[var.ident]->getType()->isPointerTy());
+    auto expr_ty = expr_->getType();
+    auto var_ty = variables_[var.ident]->getType()->getPointerElementType();
+
+    if (expr_ty->isPointerTy())
+    {
+      expr_ = b_.CreatePtrToInt(expr_, b_.getPointerStorageTy());
+    }
+    else if (expr_ty->isIntegerTy() && expr_ty != var_ty)
+    {
+      // Right-hand side of the assignment may already be an integer expression
+      // (e.g. after a field access such as "((struct A *) arg0)->x"). Make sure
+      // its size matches var_ty.
+      expr_ = b_.CreateIntCast(expr_, var_ty, false);
+    }
+
+    b_.CreateStore(expr_, variables_[var.ident]);
     // Extend lifetime of RHS up to the end of probe
     scoped_del.disarm();
   }
@@ -3421,6 +3469,17 @@ void CodegenLLVM::probereadDatastructElem(Value *src_data,
                                           location loc,
                                           const std::string &temp_name)
 {
+  auto src_ty = src_data->getType();
+
+  assert(offset->getType() == b_.getInt64Ty());
+  if (src_ty->isIntegerTy() && src_ty != b_.getInt64Ty())
+  {
+    // src_data isn't guaranteed to be a 64-bit int (e.g. array access on 32-bit
+    // systems), so add a cast if needed to avoid the size mismatch in CreateAdd
+    // below triggering an assert in LLVM
+    src_data = b_.CreateIntCast(src_data, b_.getInt64Ty(), false);
+  }
+
   Value *src = b_.CreateAdd(src_data, offset);
 
   auto dst_type = b_.GetType(elem_type);

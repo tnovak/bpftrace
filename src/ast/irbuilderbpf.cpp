@@ -391,16 +391,17 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
       "map_lookup_cond");
   CreateCondBr(condition, lookup_success_block, lookup_failure_block);
 
+  assert(value->getType()->isPointerTy());
+  llvm::Type *value_ptr_ty = value->getType()->getPointerElementType();
+
   SetInsertPoint(lookup_success_block);
   if (needMemcpy(type))
     CREATE_MEMCPY(value, call, type.GetSize(), 1);
   else
   {
-    assert(value->getType()->isPointerTy() &&
-           (value->getType()->getPointerElementType() == getInt64Ty()));
     // createMapLookup  returns an u8*
     auto *cast = CreatePointerCast(call, value->getType(), "cast");
-    CreateStore(CreateLoad(getInt64Ty(), cast), value);
+    CreateStore(CreateLoad(value_ptr_ty, cast), value);
   }
   CreateBr(lookup_merge_block);
 
@@ -408,7 +409,7 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
   if (needMemcpy(type))
     CREATE_MEMSET(value, getInt8(0), type.GetSize(), 1);
   else
-    CreateStore(getInt64(0), value);
+    CreateStore(GetIntSameSize(0, value_ptr_ty), value);
   CreateHelperError(ctx, getInt32(0), libbpf::BPF_FUNC_map_lookup_elem, loc);
   CreateBr(lookup_merge_block);
 
@@ -416,8 +417,7 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
   if (needMemcpy(type))
     return value;
 
-  // value is a pointer to i64
-  Value *ret = CreateLoad(getInt64Ty(), value);
+  Value *ret = CreateLoad(value_ptr_ty, value);
   CreateLifetimeEnd(value);
   return ret;
 }
