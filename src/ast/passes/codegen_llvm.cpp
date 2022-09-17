@@ -1944,11 +1944,30 @@ void CodegenLLVM::visit(Cast &cast)
   {
     // If casting to a pointer and the size of the integer expression doesn't
     // match the pointer size (e.g. "(struct Foo*)(uint8)42"), add an explicit
-    // cast.
+    // conversion.
     auto pointer_ty = b_.GetType(cast.type);
     if (expr_->getType() != pointer_ty)
     {
-      expr_ = b_.CreateIntCast(expr_, pointer_ty, false, "cast");
+      // Rather than keeping expr_ as an integer expression and casting it,
+      // pass it along as a pointer. This avoids BPF codegen issues when expr_
+      // is stored in a non-scalar register, e.g. PTR_TO_CTX. By using an int
+      // cast, the generated IR would be, for example:
+      //
+      //   %1 = ptrtoint i8* %0 to i64     ; ctx
+      //   %cast = trunc i64 %1 to i32     ; cast to Foo *, which is 4 bytes
+      //
+      // This would compile into the following BPF instructions:
+      //
+      //  r1 <<= 32
+      //  r1 >>= 32
+      //
+      // BPF doesn't allow shifts on pointer registers, so if r1 was initially
+      // PTX_TO_CTX, these instruction would cause it to become SCALAR_VALUE
+      // and any subsequent memory access using r1 would be rejected by the
+      // verifier. By using inttoptr the value doesn't need to be truncated
+      // and we don't hit this codegen issue.
+      expr_ = b_.CreateIntToPtr(
+          expr_, b_.GetType(*cast.type.GetPointeeTy())->getPointerTo());
     }
   }
 }
@@ -2094,6 +2113,8 @@ void CodegenLLVM::visit(AssignMapStatement &assignment)
       // GetType(map.type) depends on the pointer size.
       expr = b_.CreateIntCast(expr, b_.GetType(map.type), false);
     }
+    else if (expr_ty->isPointerTy())
+      expr = b_.CreatePtrToInt(expr, b_.getPointerStorageTy());
 
     b_.CreateStore(expr, dst);
     val = dst;
@@ -2133,29 +2154,31 @@ void CodegenLLVM::visit(AssignVarStatement &assignment)
       auto &pointee_type = var.type.IsArrayTy() ? *var.type.GetElementTy()
                                                 : var.type;
       alloca_type = CreatePointer(pointee_type, var.type.GetAS());
+
+      // Use the 64-bit int type (matching the internal size of BPF registers)
+      // for variables that contain pointers to arrays/structs, regardless of
+      // the target architecture. Otherwise, if expr_ points to a map value or
+      // to the BPF stack (i.e. it's stored in a non-scalar BPF register),
+      // truncating it (on 32-bit architectures) can generate incorrect BPF
+      // code (see also comment in CodegenLLVM::visit(Cast &)).
+      alloca_type.SetSize(8);
     }
 
     AllocaInst *val = b_.CreateAllocaBPFInit(alloca_type, var.ident);
     variables_[var.ident] = val;
   }
 
+  assert(variables_[var.ident]->getType()->isPointerTy());
+  auto expr_ty = expr_->getType();
+  auto var_ty = variables_[var.ident]->getType()->getPointerElementType();
+
   if (var.type.IsArrayTy() || var.type.IsRecordTy())
   {
     // For arrays and structs, only the pointer is stored
-    assert(variables_[var.ident]->getType()->isPointerTy());
-    auto expr_ty = expr_->getType();
-    auto var_ty = variables_[var.ident]->getType()->getPointerElementType();
-
     if (expr_ty->isPointerTy())
     {
-      expr_ = b_.CreatePtrToInt(expr_, b_.getPointerStorageTy());
-    }
-    else if (expr_ty->isIntegerTy() && expr_ty != var_ty)
-    {
-      // Right-hand side of the assignment may already be an integer expression
-      // (e.g. after a field access such as "((struct A *) arg0)->x"). Make sure
-      // its size matches var_ty.
-      expr_ = b_.CreateIntCast(expr_, var_ty, false);
+      assert(var_ty->getIntegerBitWidth() == 64);
+      expr_ = b_.CreatePtrToInt(expr_, b_.getInt64Ty());
     }
 
     b_.CreateStore(expr_, variables_[var.ident]);
@@ -2169,6 +2192,11 @@ void CodegenLLVM::visit(AssignVarStatement &assignment)
   }
   else
   {
+    if (expr_ty->isPointerTy())
+    {
+      assert(var_ty == b_.getPointerStorageTy());
+      expr_ = b_.CreatePtrToInt(expr_, b_.getPointerStorageTy());
+    }
     b_.CreateStore(expr_, variables_[var.ident]);
   }
 }
@@ -3483,6 +3511,8 @@ void CodegenLLVM::probereadDatastructElem(Value *src_data,
     // below triggering an assert in LLVM
     src_data = b_.CreateIntCast(src_data, b_.getInt64Ty(), false);
   }
+  else if (src_ty->isPointerTy())
+    src_data = b_.CreatePtrToInt(src_data, b_.getInt64Ty());
 
   Value *src = b_.CreateAdd(src_data, offset);
 
